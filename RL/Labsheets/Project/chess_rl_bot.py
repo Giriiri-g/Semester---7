@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import chess
 import chess.engine
 
-# ===================== Constants =====================
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -22,10 +21,8 @@ PIECE_VALUES = {
     chess.KING: 0
 }
 
-# ===================== Neural Network =====================
 
 class ResidualBlock(nn.Module):
-    """Standard Residual block"""
     def __init__(self, channels):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
@@ -42,18 +39,19 @@ class ResidualBlock(nn.Module):
         return x
 
 class ChessNet(nn.Module):
-    """Policy-Value Network with 18 input channels"""
     def __init__(self):
         super(ChessNet, self).__init__()
-        # Changed input channels from 14 to 18
+        # Input: 18 channels (Tactical + Material planes)
         self.conv_input = nn.Conv2d(18, 128, 3, padding=1)
         self.bn_input = nn.BatchNorm2d(128)
         self.res_blocks = nn.ModuleList([ResidualBlock(128) for _ in range(6)])
         
+        # Policy Head
         self.policy_conv = nn.Conv2d(128, 32, 1)
         self.policy_bn = nn.BatchNorm2d(32)
         self.policy_fc = nn.Linear(32 * 8 * 8, 4096)
         
+        # Value Head
         self.value_conv = nn.Conv2d(128, 16, 1)
         self.value_bn = nn.BatchNorm2d(16)
         self.value_fc1 = nn.Linear(16 * 8 * 8, 256)
@@ -75,10 +73,10 @@ class ChessNet(nn.Module):
         
         return policy, value
 
-# ===================== Board Encoding =====================
+
 
 def board_to_tensor(board):
-    """Encodes board into 18x8x8 tensor with tactical planes"""
+    """Encodes board into 18x8x8 tensor"""
     tensor = np.zeros((18, 8, 8), dtype=np.float32)
     
     piece_map = {
@@ -86,28 +84,29 @@ def board_to_tensor(board):
         chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
     }
     
-    # Channels 0-11: Piece placement
+    # 1. Piece Positions (0-11)
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
             row, col = divmod(square, 8)
             channel = piece_map[piece.piece_type]
-            if not piece.color: # Black pieces
+            if not piece.color: # Black
                 channel += 6
             tensor[channel, row, col] = 1.0
             
-    # Channel 12: Castling rights
+    # 2. Global State (12-13)
+    # Castling
     castling_val = 0.0
     if board.has_kingside_castling_rights(board.turn): castling_val += 1.0
     if board.has_queenside_castling_rights(board.turn): castling_val += 0.5
     tensor[12, :, :] = castling_val
     
-    # Channel 13: En-passant
+    # En-passant
     if board.ep_square is not None:
         r, c = divmod(board.ep_square, 8)
         tensor[13, r, c] = 1.0
 
-    # Channels 14-17: Tactical & Material planes
+    # 3. Tactical Planes (14-17)
     us = board.turn
     them = not board.turn
     
@@ -117,32 +116,25 @@ def board_to_tensor(board):
         attacked_by_us = board.is_attacked_by(us, square)
         attacked_by_them = board.is_attacked_by(them, square)
         
-        # 14: Squares attacked by us
         tensor[14, row, col] = 1.0 if attacked_by_us else 0.0
-        # 15: Squares attacked by them
         tensor[15, row, col] = 1.0 if attacked_by_them else 0.0
         
         piece = board.piece_at(square)
         if piece:
-            # Normalize piece value (max value 9 becomes 0.9)
             val = PIECE_VALUES.get(piece.piece_type, 0) / 10.0
-            
-            # 16: Aggression - Opponent piece under our attack
+            # Aggression: higher preference
             if piece.color == them and attacked_by_us:
-                tensor[16, row, col] = val
-            
-            # 17: Defense - Our piece under their attack
+                tensor[16, row, col] = val*3
+            # Defense: normal preference
             if piece.color == us and attacked_by_them:
                 tensor[17, row, col] = val
 
     return torch.FloatTensor(tensor).unsqueeze(0)
 
 def move_to_index(move):
-    """Maps move to index"""
     return int(move.from_square) * 64 + int(move.to_square)
 
 def index_to_move(index, board):
-    """Maps index to move"""
     from_sq = index // 64
     to_sq = index % 64
     move = chess.Move(from_sq, to_sq)
@@ -152,10 +144,8 @@ def index_to_move(index, board):
         if pm in board.legal_moves: return pm
     return None
 
-# ===================== MCTS =====================
 
 class MCTSNode:
-    """MCTS Node"""
     def __init__(self, board, parent=None, move=None, prior=0.0):
         self.board = board.copy()
         self.parent = parent
@@ -183,6 +173,7 @@ class MCTSNode:
         if not legal_moves:
             self.is_expanded = True
             return
+        
         for move in legal_moves:
             idx = move_to_index(move)
             prior = float(policy_probs[idx]) if 0 <= idx < len(policy_probs) else 1e-6
@@ -197,18 +188,20 @@ class MCTSNode:
         if self.parent: self.parent.backup(-value)
 
 class MCTS:
-    """MCTS Engine"""
     def __init__(self, agent, num_simulations=200):
         self.agent = agent
         self.num_simulations = num_simulations
 
     def search(self, board):
         root = MCTSNode(board)
+        
         for _ in range(self.num_simulations):
             node = root
+            # Selection
             while node.is_expanded and node.children:
                 node = node.select_child()
             
+            # Expansion & Evaluation
             if not node.board.is_game_over():
                 self.agent.model.eval()
                 state = board_to_tensor(node.board).to(self.agent.device)
@@ -218,8 +211,13 @@ class MCTS:
                     value = float(val.item())
                 node.expand(probs)
             else:
-                value = -1.0 if node.board.is_checkmate() else 0.0
+                # Terminal state handling
+                if node.board.is_checkmate():
+                    value = -1.0 
+                else:
+                    value = 0.0
             
+            # Backpropagation
             node.backup(value)
             
         move_probs = {}
@@ -228,10 +226,8 @@ class MCTS:
             move_probs[m] = c.visit_count / total_visits
         return move_probs, root.value()
 
-# ===================== Agent =====================
 
 class ChessAgent:
-    """Deep RL Agent"""
     def __init__(self, model_path=None, device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
@@ -240,7 +236,7 @@ class ChessAgent:
         
         if model_path and os.path.exists(model_path):
             self.load_model(model_path)
-            print(f"✓ Loaded model: {model_path}")
+            print(f"Loaded model: {model_path}")
 
     def select_move_mcts(self, board, temperature=1.0):
         mcts = MCTS(self, self.mcts_simulations)
@@ -300,7 +296,7 @@ class ChessAgent:
 
     def save_model(self, path):
         torch.save({'model': self.model.state_dict(), 'optim': self.optimizer.state_dict()}, path)
-        print(f"✓ Saved to {path}")
+        print(f"Saved to {path}")
 
     def load_model(self, path):
         ckpt = torch.load(path, map_location=self.device)
@@ -308,10 +304,9 @@ class ChessAgent:
         try: self.optimizer.load_state_dict(ckpt['optim'])
         except: pass
 
-# ===================== Opponent & Training =====================
+
 
 class StockfishOpponent:
-    """Stockfish Wrapper"""
     def __init__(self, path=None, level=5):
         self.level = level
         self.path = path or shutil.which("stockfish")
@@ -319,7 +314,7 @@ class StockfishOpponent:
         self.engine = chess.engine.SimpleEngine.popen_uci(self.path)
         try: self.engine.configure({"Skill Level": level})
         except: pass
-        print(f"✓ Stockfish Lvl {level} ready")
+        print(f"Stockfish Lvl {level} ready")
 
     def get_move(self, board, limit=0.1):
         return self.engine.play(board, chess.engine.Limit(time=limit)).move
@@ -328,7 +323,6 @@ class StockfishOpponent:
         self.engine.quit()
 
 class CurriculumTrainer:
-    """Training Loop"""
     def __init__(self, agent, sf_path=None):
         self.agent = agent
         self.sf_path = sf_path
@@ -379,7 +373,7 @@ class CurriculumTrainer:
                 self.agent.save_model(path)
                 print(f"Stats: {w}W {d}D {l}L")
 
-# ===================== UI & Main =====================
+
 
 def print_board(board):
     print("\n  a b c d e f g h")
@@ -393,8 +387,24 @@ def print_board(board):
     print("  ---------------")
     print("  a b c d e f g h\n")
 
+def get_human_move(board):
+    while True:
+        m_str = input("Your move (or 'quit'): ").strip()
+        
+        if m_str.lower() in ['quit', 'exit', 'resign']:
+            return None
+        
+        try:
+            move = chess.Move.from_uci(m_str)
+            if move in board.legal_moves:
+                return move
+            else:
+                print("Illegal move! Check piece movement or checks.")
+        except:
+            print("Invalid format! Use UCI (e.g., e2e4, a7a8q).")
+
 def main():
-    print("CHESS RL AGENT (Tactical Inputs)")
+    print("CHESS RL AGENT")
     print("1. Train (Quick)\n2. Train (Full)\n3. Play (MCTS)\n4. Play (Fast)")
     c = input("Choice: ").strip()
     
@@ -403,26 +413,50 @@ def main():
     
     if c in ['1', '2']:
         trainer = CurriculumTrainer(agent, sf_path)
-        stages = [(1, "Basics")] if c == '1' else [(1, "Beginner"), (5, "Inter"), (10, "Expert")]
-        games = 5 if c == '1' else 10
+        stages = [(1, "Basics")] if c == '1' else [(1, "Beginner"), (5, "Inter"), (10, "Advanced"), (12, "Expert")]
+        games = 100 if c == '1' else 500
         trainer.train_curriculum(stages, games)
     elif c in ['3', '4']:
         if not os.path.exists("chess_bot_mcts.pth"): return print("Train first!")
         agent.load_model("chess_bot_mcts.pth")
-        color = chess.WHITE if input("White/Black (w/b)? ") == 'w' else chess.BLACK
+        
+        color_input = input("White/Black (w/b)? ").lower()
+        my_color = chess.WHITE if color_input == 'w' else chess.BLACK
         board = chess.Board()
+        
+        print("\nGame Started! Type 'quit' to exit.")
         
         while not board.is_game_over():
             print_board(board)
-            if board.turn == color:
-                m_str = input("Move: ")
-                try: board.push(chess.Move.from_uci(m_str))
-                except: print("Invalid")
+            
+            if board.turn == my_color:
+                # Human Turn
+                move = get_human_move(board)
+                if move is None: 
+                    print("Game Aborted.")
+                    break
+                board.push(move)
             else:
-                m, _, v = agent.select_move_mcts(board) if c == '3' else agent.select_move_fast(board)
-                print(f"Bot: {m.uci()} (Eval: {v:.2f})")
-                board.push(m)
+                # Bot Turn
+                print("Bot thinking...")
+                if c == '3':
+                    move, _, v = agent.select_move_mcts(board)
+                else:
+                    move, _, v = agent.select_move_fast(board)
+                
+                if move is None:
+                    print("Bot has no legal moves (Stalemate/Checkmate).")
+                    break
+                    
+                print(f"Bot plays: {move.uci()} (Eval: {v:.2f})")
+                board.push(move)
+        
+        print_board(board)
         print("Game Over")
+        if board.is_checkmate():
+            print(f"Winner: {'White' if not board.turn else 'Black'}")
+        elif board.is_stalemate():
+            print("Draw (Stalemate)")
 
 if __name__ == "__main__":
     main()
